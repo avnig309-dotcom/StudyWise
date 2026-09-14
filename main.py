@@ -1,110 +1,67 @@
+import os
+from datetime import datetime, date
+
 from flask import Flask, request, jsonify, send_from_directory, session
 from werkzeug.security import generate_password_hash, check_password_hash
-from datetime import datetime
-import sqlite3
-import os
-import sys
-
-ROOT_DIR = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, ROOT_DIR)
+from dotenv import load_dotenv
+from supabase import create_client, Client
 
 from modules.priority import calculate_priority
 from modules.planner import create_plan
 from modules.recommendations import get_recommendation
 
+load_dotenv()
+
+SUPABASE_URL = os.environ.get("SUPABASE_URL")
+SUPABASE_SECRET_KEY = os.environ.get("SUPABASE_SECRET_KEY")
+
+if not SUPABASE_URL or not SUPABASE_SECRET_KEY:
+    raise RuntimeError(
+        "SUPABASE_URL and SUPABASE_SECRET_KEY must be set."
+    )
+
+supabase: Client = create_client(
+    SUPABASE_URL,
+    SUPABASE_SECRET_KEY
+)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SECRET_KEY", "studywise-secret-key")
 
-DATABASE = os.path.join(ROOT_DIR, "studywise.db")
+app.secret_key = os.environ.get(
+    "SECRET_KEY",
+    "studywise-development-secret"
+)
 
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
-def get_db():
-    conn = sqlite3.connect(DATABASE)
-    conn.row_factory = sqlite3.Row
-    return conn
-
-
-def init_db():
-    conn = get_db()
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            username TEXT NOT NULL,
-            email TEXT UNIQUE NOT NULL,
-            password TEXT NOT NULL,
-            daily_hours REAL DEFAULT 3,
-            start_time TEXT DEFAULT '09:00',
-            session_length INTEGER DEFAULT 60,
-            break_length INTEGER DEFAULT 15,
-            streak INTEGER DEFAULT 0,
-            created_at TEXT DEFAULT CURRENT_TIMESTAMP
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS subjects (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            name TEXT NOT NULL,
-            exam_date TEXT NOT NULL,
-            difficulty TEXT NOT NULL,
-            confidence TEXT NOT NULL,
-            priority REAL DEFAULT 50,
-            completed INTEGER DEFAULT 0,
-            FOREIGN KEY(user_id) REFERENCES users(id)
-        )
-    """)
-
-    conn.execute("""
-        CREATE TABLE IF NOT EXISTS tasks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER NOT NULL,
-            subject_id INTEGER,
-            task_name TEXT NOT NULL,
-            task_time TEXT,
-            completed INTEGER DEFAULT 0,
-            FOREIGN KEY(user_id) REFERENCES users(id),
-            FOREIGN KEY(subject_id) REFERENCES subjects(id)
-        )
-    """)
-
-    conn.commit()
-    conn.close()
+def current_user_id():
+    return session.get("user_id")
 
 
-init_db()
-
-def current_user():
-    user_id = session.get("user_id")
+def require_login():
+    user_id = current_user_id()
 
     if not user_id:
-        return None
+        return None, jsonify({
+            "success": False,
+            "message": "Please log in first."
+        }), 401
 
-    conn = get_db()
-    user = conn.execute(
-        "SELECT * FROM users WHERE id = ?",
-        (user_id,)
-    ).fetchone()
-    conn.close()
-
-    return user
+    return user_id, None, None
 
 
 def get_user_subjects(user_id):
-    conn = get_db()
+    response = (
+        supabase
+        .table("subjects")
+        .select("*")
+        .eq("user_id", user_id)
+        .order("priority", desc=True)
+        .execute()
+    )
 
-    subjects = conn.execute("""
-        SELECT *
-        FROM subjects
-        WHERE user_id = ?
-        ORDER BY priority DESC
-    """, (user_id,)).fetchall()
-
-    conn.close()
-
-    return [dict(subject) for subject in subjects]
+    return response.data or []
 
 
 def calculate_subject_priority(exam_date, difficulty, confidence):
@@ -118,9 +75,11 @@ def calculate_subject_priority(exam_date, difficulty, confidence):
         return 50
 
 @app.route("/")
-def index():
-    return send_from_directory(ROOT_DIR, "index.html")
-
+def home():
+    return send_from_directory(
+        os.path.dirname(os.path.abspath(__file__)),
+        "index.html"
+    )
 
 @app.route("/api/signup", methods=["POST"])
 def signup():
@@ -143,40 +102,56 @@ def signup():
             "message": "Password must be at least 6 characters."
         }), 400
 
-    conn = get_db()
+    existing = (
+        supabase
+        .table("users")
+        .select("id")
+        .eq("email", email)
+        .execute()
+    )
 
-    existing = conn.execute(
-        "SELECT id FROM users WHERE email = ?",
-        (email,)
-    ).fetchone()
-
-    if existing:
-        conn.close()
+    if existing.data:
         return jsonify({
             "success": False,
             "message": "An account with this email already exists."
-        }), 400
+        }), 409
 
     password_hash = generate_password_hash(password)
 
-    cursor = conn.execute("""
-        INSERT INTO users (username, email, password)
-        VALUES (?, ?, ?)
-    """, (username, email, password_hash))
+    result = (
+        supabase
+        .table("users")
+        .insert({
+            "username": username,
+            "email": email,
+            "password_hash": password_hash,
+            "daily_hours": 3,
+            "start_time": "18:00",
+            "session_length": 50,
+            "break_length": 10,
+            "streak": 0
+        })
+        .execute()
+    )
 
-    user_id = cursor.lastrowid
+    if not result.data:
+        return jsonify({
+            "success": False,
+            "message": "Could not create account."
+        }), 500
 
-    conn.commit()
-    conn.close()
+    user = result.data[0]
 
-    session["user_id"] = user_id
+    session["user_id"] = user["id"]
+    session["username"] = user["username"]
 
     return jsonify({
         "success": True,
         "message": "Account created successfully.",
         "user": {
-            "username": username,
-            "email": email
+            "id": user["id"],
+            "username": user["username"],
+            "email": user["email"]
         }
     })
 
@@ -189,30 +164,46 @@ def login():
     email = data.get("email", "").strip().lower()
     password = data.get("password", "")
 
-    conn = get_db()
+    if not email or not password:
+        return jsonify({
+            "success": False,
+            "message": "Please enter your email and password."
+        }), 400
 
-    user = conn.execute(
-        "SELECT * FROM users WHERE email = ?",
-        (email,)
-    ).fetchone()
+    result = (
+        supabase
+        .table("users")
+        .select("*")
+        .eq("email", email)
+        .limit(1)
+        .execute()
+    )
 
-    conn.close()
+    if not result.data:
+        return jsonify({
+            "success": False,
+            "message": "Invalid email or password."
+        }), 401
 
-    if not user or not check_password_hash(
-        user["password"],
+    user = result.data[0]
+
+    if not check_password_hash(
+        user["password_hash"],
         password
     ):
         return jsonify({
             "success": False,
-            "message": "Incorrect email or password."
+            "message": "Invalid email or password."
         }), 401
 
     session["user_id"] = user["id"]
+    session["username"] = user["username"]
 
     return jsonify({
         "success": True,
-        "message": "Welcome back!",
+        "message": "Logged in successfully.",
         "user": {
+            "id": user["id"],
             "username": user["username"],
             "email": user["email"]
         }
@@ -232,40 +223,48 @@ def logout():
 @app.route("/api/me")
 def me():
 
-    user = current_user()
+    user_id = current_user_id()
 
-    if not user:
+    if not user_id:
         return jsonify({
             "logged_in": False
         })
 
+    result = (
+        supabase
+        .table("users")
+        .select(
+            "id, username, email, daily_hours, "
+            "start_time, session_length, break_length, streak"
+        )
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not result.data:
+        session.clear()
+
+        return jsonify({
+            "logged_in": False
+        })
+
+    user = result.data[0]
+
     return jsonify({
         "logged_in": True,
-        "user": {
-            "id": user["id"],
-            "username": user["username"],
-            "email": user["email"],
-            "daily_hours": user["daily_hours"],
-            "start_time": user["start_time"],
-            "session_length": user["session_length"],
-            "break_length": user["break_length"],
-            "streak": user["streak"]
-        }
+        "user": user
     })
-
 
 @app.route("/api/subjects", methods=["GET"])
 def get_subjects():
 
-    user = current_user()
+    user_id, error, status = require_login()
 
-    if not user:
-        return jsonify({
-            "success": False,
-            "message": "Please sign in."
-        }), 401
+    if error:
+        return error, status
 
-    subjects = get_user_subjects(user["id"])
+    subjects = get_user_subjects(user_id)
 
     return jsonify({
         "success": True,
@@ -276,13 +275,10 @@ def get_subjects():
 @app.route("/api/subjects", methods=["POST"])
 def add_subject():
 
-    user = current_user()
+    user_id, error, status = require_login()
 
-    if not user:
-        return jsonify({
-            "success": False,
-            "message": "Please sign in."
-        }), 401
+    if error:
+        return error, status
 
     data = request.get_json() or {}
 
@@ -303,42 +299,40 @@ def add_subject():
         confidence
     )
 
-    conn = get_db()
+    result = (
+        supabase
+        .table("subjects")
+        .insert({
+            "user_id": user_id,
+            "name": name,
+            "exam_date": exam_date,
+            "difficulty": difficulty,
+            "confidence": confidence,
+            "priority": priority,
+            "completed": False
+        })
+        .execute()
+    )
 
-    cursor = conn.execute("""
-        INSERT INTO subjects
-        (user_id, name, exam_date, difficulty, confidence, priority)
-        VALUES (?, ?, ?, ?, ?, ?)
-    """, (
-        user["id"],
-        name,
-        exam_date,
-        difficulty,
-        confidence,
-        priority
-    ))
-
-    subject_id = cursor.lastrowid
-
-    conn.commit()
-    conn.close()
+    if not result.data:
+        return jsonify({
+            "success": False,
+            "message": "Could not add subject."
+        }), 500
 
     return jsonify({
         "success": True,
-        "subject_id": subject_id
+        "subject": result.data[0]
     })
 
 
 @app.route("/api/subjects/<int:subject_id>", methods=["PUT"])
-def edit_subject(subject_id):
+def update_subject(subject_id):
 
-    user = current_user()
+    user_id, error, status = require_login()
 
-    if not user:
-        return jsonify({
-            "success": False,
-            "message": "Please sign in."
-        }), 401
+    if error:
+        return error, status
 
     data = request.get_json() or {}
 
@@ -350,7 +344,7 @@ def edit_subject(subject_id):
     if not name or not exam_date:
         return jsonify({
             "success": False,
-            "message": "Please fill in all fields."
+            "message": "Subject name and exam date are required."
         }), 400
 
     priority = calculate_subject_priority(
@@ -359,62 +353,49 @@ def edit_subject(subject_id):
         confidence
     )
 
-    conn = get_db()
+    result = (
+        supabase
+        .table("subjects")
+        .update({
+            "name": name,
+            "exam_date": exam_date,
+            "difficulty": difficulty,
+            "confidence": confidence,
+            "priority": priority
+        })
+        .eq("id", subject_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
 
-    result = conn.execute("""
-        UPDATE subjects
-        SET name = ?,
-            exam_date = ?,
-            difficulty = ?,
-            confidence = ?,
-            priority = ?
-        WHERE id = ?
-        AND user_id = ?
-    """, (
-        name,
-        exam_date,
-        difficulty,
-        confidence,
-        priority,
-        subject_id,
-        user["id"]
-    ))
-
-    conn.commit()
-    conn.close()
-
-    if result.rowcount == 0:
+    if not result.data:
         return jsonify({
             "success": False,
             "message": "Subject not found."
         }), 404
 
     return jsonify({
-        "success": True
+        "success": True,
+        "subject": result.data[0]
     })
 
 
 @app.route("/api/subjects/<int:subject_id>", methods=["DELETE"])
 def delete_subject(subject_id):
 
-    user = current_user()
+    user_id, error, status = require_login()
 
-    if not user:
-        return jsonify({
-            "success": False,
-            "message": "Please sign in."
-        }), 401
+    if error:
+        return error, status
 
-    conn = get_db()
-
-    conn.execute("""
-        DELETE FROM subjects
-        WHERE id = ?
-        AND user_id = ?
-    """, (subject_id, user["id"]))
-
-    conn.commit()
-    conn.close()
+    result = (
+        supabase
+        .table("subjects")
+        .delete()
+        .eq("id", subject_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
 
     return jsonify({
         "success": True
@@ -424,154 +405,162 @@ def delete_subject(subject_id):
 @app.route("/api/subjects/<int:subject_id>/complete", methods=["POST"])
 def complete_subject(subject_id):
 
-    user = current_user()
+    user_id, error, status = require_login()
 
-    if not user:
+    if error:
+        return error, status
+
+    subject_result = (
+        supabase
+        .table("subjects")
+        .select("completed")
+        .eq("id", subject_id)
+        .eq("user_id", user_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not subject_result.data:
         return jsonify({
             "success": False,
-            "message": "Please sign in."
-        }), 401
+            "message": "Subject not found."
+        }), 404
 
-    data = request.get_json() or {}
-    completed = 1 if data.get("completed") else 0
+    current_status = subject_result.data[0]["completed"]
 
-    conn = get_db()
-
-    conn.execute("""
-        UPDATE subjects
-        SET completed = ?
-        WHERE id = ?
-        AND user_id = ?
-    """, (
-        completed,
-        subject_id,
-        user["id"]
-    ))
-
-    conn.commit()
-    conn.close()
+    result = (
+        supabase
+        .table("subjects")
+        .update({
+            "completed": not current_status
+        })
+        .eq("id", subject_id)
+        .eq("user_id", user_id)
+        .execute()
+    )
 
     return jsonify({
-        "success": True
+        "success": True,
+        "completed": not current_status
     })
-
 
 @app.route("/api/settings", methods=["PUT"])
 def update_settings():
 
-    user = current_user()
+    user_id, error, status = require_login()
 
-    if not user:
-        return jsonify({
-            "success": False,
-            "message": "Please sign in."
-        }), 401
+    if error:
+        return error, status
 
     data = request.get_json() or {}
 
     try:
         daily_hours = float(data.get("daily_hours", 3))
-    except:
+        session_length = int(data.get("session_length", 50))
+        break_length = int(data.get("break_length", 10))
+    except (ValueError, TypeError):
+        return jsonify({
+            "success": False,
+            "message": "Invalid settings."
+        }), 400
+
+    start_time = data.get("start_time", "18:00")
+
+    if daily_hours <= 0:
         daily_hours = 3
 
-    start_time = data.get("start_time", "09:00")
-
-    try:
-        session_length = int(data.get("session_length", 60))
-    except:
-        session_length = 60
-
-    try:
-        break_length = int(data.get("break_length", 15))
-    except:
-        break_length = 15
-
-    conn = get_db()
-
-    conn.execute("""
-        UPDATE users
-        SET daily_hours = ?,
-            start_time = ?,
-            session_length = ?,
-            break_length = ?
-        WHERE id = ?
-    """, (
-        daily_hours,
-        start_time,
-        session_length,
-        break_length,
-        user["id"]
-    ))
-
-    conn.commit()
-    conn.close()
+    result = (
+        supabase
+        .table("users")
+        .update({
+            "daily_hours": daily_hours,
+            "start_time": start_time,
+            "session_length": session_length,
+            "break_length": break_length
+        })
+        .eq("id", user_id)
+        .execute()
+    )
 
     return jsonify({
-        "success": True
+        "success": True,
+        "settings": result.data[0] if result.data else {}
     })
-
 
 @app.route("/api/dashboard")
 def dashboard():
 
-    user = current_user()
+    user_id, error, status = require_login()
 
-    if not user:
+    if error:
+        return error, status
+
+    user_result = (
+        supabase
+        .table("users")
+        .select("*")
+        .eq("id", user_id)
+        .limit(1)
+        .execute()
+    )
+
+    if not user_result.data:
         return jsonify({
             "success": False,
-            "message": "Please sign in."
-        }), 401
+            "message": "User not found."
+        }), 404
 
-    subjects = get_user_subjects(user["id"])
+    user = user_result.data[0]
+
+    subjects = get_user_subjects(user_id)
+
+    try:
+        daily_hours = float(user.get("daily_hours") or 3)
+    except (ValueError, TypeError):
+        daily_hours = 3
 
     try:
         plan = create_plan(
             subjects,
-            float(user["daily_hours"])
+            daily_hours
         )
     except Exception:
         plan = []
 
     try:
-        recommendation = get_recommendation(subjects)
+        recommendation = get_recommendation(
+            subjects
+        )
     except Exception:
-        recommendation = "Focus on your highest-priority subject first."
+        recommendation = (
+            "Focus on your highest-priority subject first."
+        )
 
-    completed = sum(
+    completed_count = sum(
         1 for subject in subjects
         if subject.get("completed")
     )
 
-    total = len(subjects)
+    total_count = len(subjects)
 
-    progress = 0
-
-    if total:
+    if total_count:
         progress = round(
-            (completed / total) * 100
+            (completed_count / total_count) * 100
         )
+    else:
+        progress = 0
 
     return jsonify({
         "success": True,
+        "user": user,
         "subjects": subjects,
         "plan": plan,
         "recommendation": recommendation,
         "progress": progress,
-        "completed": completed,
-        "total": total,
-        "user": {
-            "username": user["username"],
-            "email": user["email"],
-            "daily_hours": user["daily_hours"],
-            "start_time": user["start_time"],
-            "session_length": user["session_length"],
-            "break_length": user["break_length"],
-            "streak": user["streak"]
-        }
+        "completed_count": completed_count,
+        "total_count": total_count
     })
 
-
-# run
 
 if __name__ == "__main__":
     app.run(
