@@ -78,7 +78,7 @@ or:
 
 | Part            | Technology                |
 | --------------- | ------------------------- |
-| Interface       | Streamlit                 |
+| Interface       | HTML, CSS, JS             |
 | Main Logic      | Python                    |
 | Data            | SQLite + Pandas           |
 | Visualizations  | Plotly                    |
