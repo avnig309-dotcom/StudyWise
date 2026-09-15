@@ -1,1 +1,4 @@
-Flask
+flask
+werkzeug
+python-dotenv
+supabase
